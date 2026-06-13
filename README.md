@@ -18,6 +18,14 @@ uses:
 - Embeddings provider: `ollama`
 - Embeddings model: `nomic-embed-text`
 
+It also tries to restart the OpenClaw systemd service automatically after
+writing the config. If your service is not named `openclaw` or
+`openclaw-gateway`, pass it explicitly:
+
+```bash
+./tools/openclaw_enable_dreaming.sh --service-name your-openclaw.service
+```
+
 If Ollama is not installed on your Linux server, run:
 
 ```bash
@@ -70,10 +78,13 @@ Custom schedule:
 - Configures embeddings for DashScope/OpenAI/Ollama.
 - Pulls the Ollama embedding model by default when using `--provider ollama`.
 - Enables MMR and temporal decay for higher quality retrieval.
+- Restarts the OpenClaw systemd service when it can identify it.
 
-## Verify after restart
+## Verify
 
-Restart your OpenClaw Gateway/service, then run:
+The script attempts to restart OpenClaw before indexing. If auto-detection did
+not find your service, rerun with `--service-name NAME` or restart OpenClaw
+manually. Then verify:
 
 ```bash
 openclaw memory index --force --agent main

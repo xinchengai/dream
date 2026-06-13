@@ -14,6 +14,8 @@ DRY_RUN=0
 SKIP_INDEX=0
 PULL_OLLAMA=1
 INSTALL_OLLAMA=0
+RESTART_OPENCLAW=1
+SERVICE_NAME="${OPENCLAW_SERVICE_NAME:-}"
 
 usage() {
   cat <<'USAGE'
@@ -26,6 +28,7 @@ What it does:
   - Enables plugins.entries.memory-core.config.dreaming.
   - Checks and fixes common dreaming.model trust-gate config issues.
   - Configures agents.defaults.memorySearch embedding provider.
+  - Restarts OpenClaw when it can identify a systemd service.
   - Optionally runs openclaw memory index/status when openclaw is on PATH.
 
 Recommended local Ollama run:
@@ -55,6 +58,8 @@ Options:
   --install-ollama      For --provider ollama, install Ollama on Linux if missing.
   --pull-ollama         For --provider ollama, run: ollama pull MODEL. Default for ollama.
   --no-pull-ollama      For --provider ollama, skip model pull.
+  --service-name NAME   OpenClaw systemd service name. Auto-detected by default.
+  --no-restart          Do not restart OpenClaw service after writing config.
   --skip-index          Do not run openclaw memory index/status.
   --dry-run             Print the updated config without writing it.
   -h, --help            Show this help.
@@ -75,6 +80,8 @@ while [[ $# -gt 0 ]]; do
     --install-ollama) INSTALL_OLLAMA=1; shift ;;
     --pull-ollama) PULL_OLLAMA=1; shift ;;
     --no-pull-ollama) PULL_OLLAMA=0; shift ;;
+    --service-name) SERVICE_NAME="${2:?missing service name}"; shift 2 ;;
+    --no-restart) RESTART_OPENCLAW=0; shift ;;
     --skip-index) SKIP_INDEX=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -160,6 +167,84 @@ if [[ "$PROVIDER" == "ollama" ]]; then
     fi
   fi
 fi
+
+run_sudo() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    echo "sudo is not available; cannot run: $*" >&2
+    return 1
+  fi
+}
+
+systemctl_cmd() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl "$@"
+  else
+    return 127
+  fi
+}
+
+detect_openclaw_service() {
+  if [[ -n "$SERVICE_NAME" ]]; then
+    printf '%s\n' "$SERVICE_NAME"
+    return 0
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local candidate
+  for candidate in openclaw openclaw-gateway openclaw.service openclaw-gateway.service; do
+    if systemctl list-unit-files "${candidate%.service}.service" --no-legend 2>/dev/null | grep -q .; then
+      printf '%s\n' "${candidate%.service}.service"
+      return 0
+    fi
+  done
+
+  local discovered
+  discovered="$(systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^openclaw.*\.service$' | head -n 1 || true)"
+  if [[ -n "$discovered" ]]; then
+    printf '%s\n' "$discovered"
+    return 0
+  fi
+
+  return 1
+}
+
+restart_openclaw() {
+  if [[ "$RESTART_OPENCLAW" -ne 1 ]]; then
+    echo "Skipped OpenClaw restart."
+    return 0
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "Warning: systemctl not found; cannot auto-restart OpenClaw."
+    echo "         Restart your OpenClaw Gateway/service manually."
+    return 0
+  fi
+
+  local service
+  if ! service="$(detect_openclaw_service)"; then
+    echo "Warning: could not auto-detect the OpenClaw systemd service."
+    echo "         Rerun with --service-name NAME, or restart OpenClaw manually."
+    return 0
+  fi
+
+  echo
+  echo "Restarting OpenClaw service: $service"
+  if run_sudo systemctl restart "$service"; then
+    sleep 2
+    systemctl_cmd is-active --quiet "$service" \
+      && echo "OpenClaw service is active: $service" \
+      || echo "Warning: $service restarted but is not active. Check: systemctl status $service"
+  else
+    echo "Warning: failed to restart $service. Check permissions or service name."
+  fi
+}
 
 TMP_OUTPUT="$(mktemp)"
 cleanup() {
@@ -383,6 +468,8 @@ printf '%s\n' "$UPDATED_CONFIG" > "$CONFIG_PATH"
 chmod 600 "$CONFIG_PATH" || true
 echo "Updated config written: $CONFIG_PATH"
 
+restart_openclaw
+
 if [[ "$SKIP_INDEX" -eq 0 && -x "$(command -v openclaw 2>/dev/null || true)" ]]; then
   echo
   echo "Running OpenClaw memory index/status checks..."
@@ -396,7 +483,7 @@ fi
 cat <<'NEXT'
 
 Next steps:
-  1. Restart OpenClaw Gateway / service so the new config is loaded.
+  1. If auto-restart did not find your service, rerun with: --service-name NAME
   2. Run: openclaw memory status --deep --agent main
   3. If embeddings are still unavailable with Ollama, confirm:
      - ollama list
