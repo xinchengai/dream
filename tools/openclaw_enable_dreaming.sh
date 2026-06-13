@@ -3,6 +3,8 @@ set -euo pipefail
 
 CONFIG_PATH="${OPENCLAW_CONFIG:-$HOME/.openclaw/openclaw.json}"
 WORKSPACE_DIR="${OPENCLAW_WORKSPACE:-$HOME/.openclaw/workspace}"
+LOG_DIR="${OPENCLAW_LOG_DIR:-$HOME/.openclaw/logs}"
+
 PROVIDER="ollama"
 MODEL=""
 BASE_URL=""
@@ -10,6 +12,7 @@ API_KEY=""
 WRITE_API_KEY=1
 FREQUENCY="${OPENCLAW_DREAMING_FREQUENCY:-0 3 * * *}"
 DREAM_MODEL="${OPENCLAW_DREAMING_MODEL:-}"
+
 DRY_RUN=0
 SKIP_INDEX=0
 PULL_OLLAMA=1
@@ -17,6 +20,11 @@ INSTALL_OLLAMA=0
 RESTART_OPENCLAW=1
 SERVICE_NAME="${OPENCLAW_SERVICE_NAME:-}"
 RESTART_METHOD="auto"
+CPU_TUNE=1
+EMBEDDING_TIMEOUT_SECONDS="${OPENCLAW_EMBEDDING_TIMEOUT_SECONDS:-600}"
+OLLAMA_URL="${OLLAMA_URL:-http://127.0.0.1:11434}"
+OPENCLAW_RESTART_CONFIRMED=0
+VALIDATION_STATUS=""
 
 usage() {
   cat <<'USAGE'
@@ -24,16 +32,16 @@ Usage:
   tools/openclaw_enable_dreaming.sh [options]
 
 What it does:
+  - Installs/starts Ollama when requested.
+  - Tunes Ollama for CPU-only servers by default.
   - Backs up ~/.openclaw/openclaw.json if it exists.
-  - Creates the OpenClaw memory workspace directories.
-  - Enables plugins.entries.memory-core.config.dreaming.
-  - Checks and fixes common dreaming.model trust-gate config issues.
-  - Configures agents.defaults.memorySearch embedding provider.
-  - Detects and restarts the OpenClaw service when possible.
-  - Optionally runs openclaw memory index/status when openclaw is on PATH.
+  - Enables OpenClaw Dreaming.
+  - Configures local Ollama embeddings.
+  - Restarts OpenClaw when possible.
+  - Indexes and validates memory search readiness.
 
-Recommended local Ollama run:
-  tools/openclaw_enable_dreaming.sh
+Recommended Alibaba Cloud CPU-only run:
+  tools/openclaw_enable_dreaming.sh --install-ollama
 
 Provider options:
   --provider dashscope  Use Alibaba Cloud Model Studio OpenAI-compatible embeddings.
@@ -49,23 +57,391 @@ Options:
                        Prefer env vars when possible:
                        DASHSCOPE_API_KEY or OPENAI_API_KEY.
   --no-write-api-key    Do not write the API key into openclaw.json.
-                       Make sure the OpenClaw service environment has the key.
   --base-url URL        Custom compatible base URL.
-                       dashscope default: https://dashscope.aliyuncs.com/compatible-mode/v1
   --frequency CRON      Dreaming cron frequency. Default: "0 3 * * *".
   --dream-model MODEL   Optional Dream Diary model override.
   --config PATH         Config path. Default: ~/.openclaw/openclaw.json.
   --workspace PATH      Workspace path. Default: ~/.openclaw/workspace.
-  --install-ollama      For --provider ollama, install Ollama on Linux if missing.
-  --pull-ollama         For --provider ollama, run: ollama pull MODEL. Default for ollama.
-  --no-pull-ollama      For --provider ollama, skip model pull.
+  --install-ollama      Install Ollama on Linux when missing.
+  --pull-ollama         Pull the Ollama embedding model. Default for ollama.
+  --no-pull-ollama      Skip model pull.
+  --cpu-only            Tune Ollama/OpenClaw for CPU-only embedding. Default.
+  --no-cpu-tune         Skip CPU-only tuning.
+  --embedding-timeout N OpenClaw local embedding timeout seconds. Default: 600.
   --service-name NAME   OpenClaw systemd service name. Auto-detected by default.
   --restart-method M    Restart method: auto, systemd, pm2, docker, none.
-  --no-restart          Do not restart OpenClaw service after writing config.
-  --skip-index          Do not run openclaw memory index/status.
+  --no-restart          Do not restart OpenClaw after writing config.
+  --skip-index          Do not run OpenClaw memory index/status validation.
   --dry-run             Print the updated config without writing it.
   -h, --help            Show this help.
 USAGE
+}
+
+run_sudo() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    echo "sudo is not available; cannot run: $*" >&2
+    return 1
+  fi
+}
+
+systemctl_cmd() {
+  command -v systemctl >/dev/null 2>&1 || return 127
+  systemctl "$@"
+}
+
+write_root_file() {
+  local path="$1"
+  local content="$2"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    printf '%s\n' "$content" > "$path"
+  elif command -v sudo >/dev/null 2>&1; then
+    printf '%s\n' "$content" | sudo tee "$path" >/dev/null
+  else
+    echo "sudo is not available; cannot write $path" >&2
+    return 1
+  fi
+}
+
+service_loaded() {
+  local service="$1"
+  [[ "$(systemctl show "$service" --property=LoadState --value 2>/dev/null || true)" == "loaded" ]]
+}
+
+wait_for_ollama() {
+  local attempts="${1:-30}"
+  local delay="${2:-1}"
+  local i
+  for ((i = 1; i <= attempts; i++)); do
+    if curl -fsS --max-time 3 "$OLLAMA_URL/api/version" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "$delay"
+  done
+  return 1
+}
+
+ensure_ollama_background() {
+  mkdir -p "$LOG_DIR"
+  if pgrep -af 'ollama serve' >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Starting Ollama in background; log: $LOG_DIR/ollama.log"
+  nohup ollama serve >>"$LOG_DIR/ollama.log" 2>&1 &
+  sleep 2
+}
+
+tune_ollama_cpu() {
+  [[ "$PROVIDER" == "ollama" && "$CPU_TUNE" -eq 1 ]] || return 0
+
+  echo
+  echo "Applying CPU-only Ollama tuning..."
+
+  if command -v systemctl >/dev/null 2>&1 && service_loaded "ollama.service"; then
+    local override_dir="/etc/systemd/system/ollama.service.d"
+    local override_file="$override_dir/openclaw-cpu.conf"
+    local override_content
+    override_content='[Service]
+Environment="OLLAMA_HOST=127.0.0.1:11434"
+Environment="OLLAMA_NUM_PARALLEL=1"
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+Environment="OLLAMA_KEEP_ALIVE=10m"
+Environment="OLLAMA_LOAD_TIMEOUT=10m"
+Environment="OLLAMA_MAX_QUEUE=64"'
+
+    run_sudo mkdir -p "$override_dir"
+    write_root_file "$override_file" "$override_content"
+    run_sudo systemctl daemon-reload
+    run_sudo systemctl enable --now ollama
+    run_sudo systemctl restart ollama
+    wait_for_ollama 45 1 || echo "Warning: Ollama API did not respond after systemd restart."
+    return 0
+  fi
+
+  if command -v ollama >/dev/null 2>&1; then
+    export OLLAMA_HOST="127.0.0.1:11434"
+    export OLLAMA_NUM_PARALLEL="1"
+    export OLLAMA_MAX_LOADED_MODELS="1"
+    export OLLAMA_KEEP_ALIVE="10m"
+    export OLLAMA_LOAD_TIMEOUT="10m"
+    export OLLAMA_MAX_QUEUE="64"
+    ensure_ollama_background
+    wait_for_ollama 30 1 || echo "Warning: Ollama API did not respond after background start."
+  fi
+}
+
+install_or_start_ollama() {
+  [[ "$PROVIDER" == "ollama" ]] || return 0
+
+  if ! command -v ollama >/dev/null 2>&1; then
+    if [[ "$INSTALL_OLLAMA" -ne 1 ]]; then
+      echo "Warning: ollama is not installed or not on PATH."
+      echo "         Rerun with --install-ollama to install it automatically."
+      return 0
+    fi
+    if [[ "$(uname -s)" != "Linux" ]]; then
+      echo "--install-ollama is only supported on Linux by this script." >&2
+      exit 1
+    fi
+    echo "Installing Ollama with the official installer..."
+    curl -fsSL https://ollama.com/install.sh | sh
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 && service_loaded "ollama.service"; then
+    run_sudo systemctl enable --now ollama || true
+  elif command -v ollama >/dev/null 2>&1; then
+    ensure_ollama_background
+  fi
+
+  tune_ollama_cpu
+}
+
+ollama_model_present() {
+  command -v ollama >/dev/null 2>&1 || return 1
+  ollama list 2>/dev/null | awk 'NR > 1 { print $1 }' | grep -Fxq "$MODEL"
+}
+
+pull_ollama_model() {
+  [[ "$PROVIDER" == "ollama" && "$PULL_OLLAMA" -eq 1 ]] || return 0
+  command -v ollama >/dev/null 2>&1 || return 0
+
+  if ! wait_for_ollama 30 1; then
+    echo "Warning: Ollama service is not responding at $OLLAMA_URL."
+    echo "         The script will still write OpenClaw config."
+    return 0
+  fi
+
+  if ollama_model_present; then
+    echo "Ollama model already present: $MODEL"
+  else
+    ollama pull "$MODEL"
+  fi
+}
+
+warm_up_ollama_embedding() {
+  [[ "$PROVIDER" == "ollama" ]] || return 0
+  wait_for_ollama 10 1 || return 0
+
+  echo "Warming up Ollama embedding model..."
+  local embed_payload embeddings_payload
+  embed_payload="$(printf '{"model":"%s","input":"openclaw memory warmup"}' "$MODEL")"
+  embeddings_payload="$(printf '{"model":"%s","prompt":"openclaw memory warmup"}' "$MODEL")"
+
+  if curl -fsS --max-time 120 \
+    -H 'Content-Type: application/json' \
+    -d "$embed_payload" \
+    "$OLLAMA_URL/api/embed" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  curl -fsS --max-time 120 \
+    -H 'Content-Type: application/json' \
+    -d "$embeddings_payload" \
+    "$OLLAMA_URL/api/embeddings" >/dev/null 2>&1 || echo "Warning: Ollama embedding warm-up failed."
+}
+
+detect_service_from_process() {
+  [[ -d /proc ]] || return 1
+
+  local pid unit
+  while read -r pid _; do
+    [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ -r "/proc/$pid/cgroup" ]] || continue
+    unit="$(grep -Eo '[A-Za-z0-9_.@:-]*openclaw[A-Za-z0-9_.@:-]*\.service' "/proc/$pid/cgroup" | head -n 1 || true)"
+    if [[ -n "$unit" ]] && service_loaded "$unit"; then
+      printf '%s\n' "$unit"
+      return 0
+    fi
+  done < <(pgrep -af 'openclaw|openclaw-gateway' 2>/dev/null || true)
+
+  return 1
+}
+
+detect_openclaw_service() {
+  if [[ -n "$SERVICE_NAME" ]]; then
+    if service_loaded "$SERVICE_NAME"; then
+      printf '%s\n' "$SERVICE_NAME"
+      return 0
+    fi
+    echo "Warning: requested service is not loaded: $SERVICE_NAME"
+    return 1
+  fi
+
+  command -v systemctl >/dev/null 2>&1 || return 1
+
+  local candidate
+  for candidate in openclaw.service openclaw-gateway.service gateway.service; do
+    if service_loaded "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  local discovered
+  discovered="$(
+    {
+      systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}'
+      systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}'
+    } | grep -Ei '(^|[-_.@])(openclaw|openclaw-gateway)([-_.@]|$)' | head -n 1 || true
+  )"
+  if [[ -n "$discovered" ]] && service_loaded "$discovered"; then
+    printf '%s\n' "$discovered"
+    return 0
+  fi
+
+  detect_service_from_process
+}
+
+restart_openclaw_systemd() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+
+  local service
+  service="$(detect_openclaw_service || true)"
+  [[ -n "$service" ]] || return 1
+
+  echo
+  echo "Restarting OpenClaw service: $service"
+  if run_sudo systemctl restart "$service"; then
+    sleep 2
+    if systemctl_cmd is-active --quiet "$service"; then
+      echo "OpenClaw service is active: $service"
+      OPENCLAW_RESTART_CONFIRMED=1
+    else
+      echo "Warning: $service restarted but is not active. Check: systemctl status $service"
+    fi
+    return 0
+  fi
+
+  echo "Warning: failed to restart $service. Check permissions or service name."
+  return 1
+}
+
+restart_openclaw_pm2() {
+  command -v pm2 >/dev/null 2>&1 || return 1
+
+  local ids pm2_json
+  pm2_json="$(pm2 jlist 2>/dev/null || true)"
+  ids="$(PM2_JSON="$pm2_json" node <<'NODE' || true
+try {
+  const apps = JSON.parse(process.env.PM2_JSON || "[]");
+  const matches = apps.filter((app) => {
+    const name = String(app.name || "");
+    const script = String(app.pm2_env?.pm_exec_path || "");
+    const args = Array.isArray(app.pm2_env?.args) ? app.pm2_env.args.join(" ") : String(app.pm2_env?.args || "");
+    return /openclaw|gateway/i.test(`${name} ${script} ${args}`);
+  });
+  process.stdout.write(matches.map((app) => String(app.pm_id)).join(" "));
+} catch {}
+NODE
+)"
+
+  [[ -n "$ids" ]] || return 1
+
+  echo
+  echo "Restarting OpenClaw pm2 app(s): $ids"
+  pm2 restart $ids
+  OPENCLAW_RESTART_CONFIRMED=1
+  return 0
+}
+
+restart_openclaw_docker() {
+  command -v docker >/dev/null 2>&1 || return 1
+
+  local containers
+  containers="$(docker ps --format '{{.ID}} {{.Names}} {{.Image}}' 2>/dev/null | awk 'tolower($0) ~ /openclaw|gateway/ { print $1 }' | tr '\n' ' ' || true)"
+  [[ -n "$containers" ]] || return 1
+
+  echo
+  echo "Restarting OpenClaw docker container(s): $containers"
+  docker restart $containers
+  OPENCLAW_RESTART_CONFIRMED=1
+  return 0
+}
+
+restart_openclaw() {
+  [[ "$RESTART_OPENCLAW" -eq 1 ]] || {
+    echo "Skipped OpenClaw restart."
+    return 0
+  }
+
+  case "$RESTART_METHOD" in
+    auto|systemd|pm2|docker|none) ;;
+    *)
+      echo "Warning: unsupported restart method: $RESTART_METHOD"
+      echo "         Supported: auto, systemd, pm2, docker, none"
+      return 0
+      ;;
+  esac
+
+  [[ "$RESTART_METHOD" != "none" ]] || {
+    echo "Skipped OpenClaw restart."
+    return 0
+  }
+
+  if [[ "$RESTART_METHOD" == "auto" || "$RESTART_METHOD" == "systemd" ]]; then
+    restart_openclaw_systemd && return 0
+    [[ "$RESTART_METHOD" == "systemd" ]] && return 0
+  fi
+  if [[ "$RESTART_METHOD" == "auto" || "$RESTART_METHOD" == "pm2" ]]; then
+    restart_openclaw_pm2 && return 0
+    [[ "$RESTART_METHOD" == "pm2" ]] && return 0
+  fi
+  if [[ "$RESTART_METHOD" == "auto" || "$RESTART_METHOD" == "docker" ]]; then
+    restart_openclaw_docker && return 0
+    [[ "$RESTART_METHOD" == "docker" ]] && return 0
+  fi
+
+  echo "Warning: could not auto-restart OpenClaw."
+  echo "         Tried systemd, pm2, and Docker detection. Config was still written."
+  return 0
+}
+
+run_openclaw_validation() {
+  if [[ "$SKIP_INDEX" -eq 1 || ! -x "$(command -v openclaw 2>/dev/null || true)" ]]; then
+    echo
+    echo "Skipped OpenClaw index/status checks."
+    VALIDATION_STATUS="skipped"
+    return 0
+  fi
+
+  echo
+  echo "Running OpenClaw memory index/status checks..."
+  openclaw memory index --force --agent main || openclaw memory index --force || true
+
+  local status_output
+  status_output="$(openclaw memory status --deep --agent main 2>&1 || openclaw memory status --deep 2>&1 || true)"
+  printf '%s\n' "$status_output"
+
+  if grep -q 'Provider: ollama' <<<"$status_output" \
+    && grep -q 'Embeddings: ready' <<<"$status_output" \
+    && grep -q 'Semantic vectors: ready' <<<"$status_output" \
+    && grep -q 'Dreaming:' <<<"$status_output"; then
+    VALIDATION_STATUS="success"
+    return 0
+  fi
+
+  VALIDATION_STATUS="failed"
+  return 0
+}
+
+print_final_status() {
+  echo
+  if [[ "$VALIDATION_STATUS" == "success" ]]; then
+    echo "SUCCESS: OpenClaw Dreaming is configured with Ollama CPU-only embeddings."
+    if [[ "$OPENCLAW_RESTART_CONFIRMED" -eq 1 ]]; then
+      echo "OpenClaw restart: confirmed."
+    else
+      echo "OpenClaw restart: not confirmed, but memory validation succeeded."
+    fi
+  elif [[ "$VALIDATION_STATUS" == "skipped" ]]; then
+    echo "DONE: Config was written. Validation was skipped."
+  else
+    echo "DONE WITH WARNINGS: Config was written, but final validation did not report full readiness."
+    echo "Expected: Provider: ollama, Embeddings: ready, Semantic vectors: ready, Dreaming: ..."
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -82,6 +458,9 @@ while [[ $# -gt 0 ]]; do
     --install-ollama) INSTALL_OLLAMA=1; shift ;;
     --pull-ollama) PULL_OLLAMA=1; shift ;;
     --no-pull-ollama) PULL_OLLAMA=0; shift ;;
+    --cpu-only) CPU_TUNE=1; shift ;;
+    --no-cpu-tune) CPU_TUNE=0; shift ;;
+    --embedding-timeout) EMBEDDING_TIMEOUT_SECONDS="${2:?missing timeout seconds}"; shift 2 ;;
     --service-name) SERVICE_NAME="${2:?missing service name}"; shift 2 ;;
     --restart-method) RESTART_METHOD="${2:?missing restart method}"; shift 2 ;;
     --no-restart) RESTART_OPENCLAW=0; RESTART_METHOD="none"; shift ;;
@@ -114,19 +493,25 @@ case "$PROVIDER" in
     ;;
 esac
 
+if ! [[ "$EMBEDDING_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "--embedding-timeout must be a positive integer." >&2
+  exit 2
+fi
+
 if ! command -v node >/dev/null 2>&1; then
   echo "node is required to safely update openclaw.json." >&2
   exit 1
 fi
 
 mkdir -p "$(dirname "$CONFIG_PATH")"
-mkdir -p "$WORKSPACE_DIR/memory/.dreams"
+mkdir -p "$WORKSPACE_DIR/memory/.dreams" "$LOG_DIR"
 
 echo "OpenClaw config: $CONFIG_PATH"
 echo "OpenClaw workspace: $WORKSPACE_DIR"
 echo "Embedding provider: $PROVIDER"
 echo "Embedding model: $MODEL"
 echo "Dreaming frequency: $FREQUENCY"
+echo "CPU tuning: $([[ "$CPU_TUNE" -eq 1 ]] && echo enabled || echo disabled)"
 
 if command -v openclaw >/dev/null 2>&1; then
   echo "Detected OpenClaw:"
@@ -137,237 +522,16 @@ fi
 
 if [[ "$PROVIDER" == "dashscope" && -z "$API_KEY" ]]; then
   echo "Warning: DASHSCOPE_API_KEY is not set and --api-key was not provided."
-  echo "         The script will configure the DashScope provider, but embeddings will not work until an API key is available."
 fi
-
 if [[ "$PROVIDER" == "openai" && -z "$API_KEY" ]]; then
   echo "Warning: OPENAI_API_KEY is not set and --api-key was not provided."
-  echo "         The script will configure OpenAI, but embeddings will not work until an API key is available."
 fi
 
-if [[ "$PROVIDER" == "ollama" ]]; then
-  if ! command -v ollama >/dev/null 2>&1; then
-    if [[ "$INSTALL_OLLAMA" -eq 1 ]]; then
-      if [[ "$(uname -s)" != "Linux" ]]; then
-        echo "--install-ollama is only supported on Linux by this script." >&2
-        exit 1
-      fi
-      echo "Installing Ollama with the official installer..."
-      curl -fsSL https://ollama.com/install.sh | sh
-      if command -v systemctl >/dev/null 2>&1; then
-        if [[ "$(id -u)" -eq 0 ]]; then
-          systemctl enable --now ollama || true
-        elif command -v sudo >/dev/null 2>&1; then
-          sudo systemctl enable --now ollama || true
-        fi
-      fi
-    else
-      echo "Warning: ollama is not installed or not on PATH."
-      echo "         Install it first, or rerun this script with --install-ollama on Linux."
-    fi
-  fi
-
-  if command -v ollama >/dev/null 2>&1 && [[ "$PULL_OLLAMA" -eq 1 ]]; then
-    if ! curl -fsS --max-time 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
-      echo "Warning: Ollama service is not responding at http://127.0.0.1:11434."
-      echo "         Start it first, for example: systemctl enable --now ollama"
-      echo "         The script will still write OpenClaw config."
-    else
-      ollama pull "$MODEL"
-    fi
-  fi
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  install_or_start_ollama
+  pull_ollama_model
+  warm_up_ollama_embedding
 fi
-
-run_sudo() {
-  if [[ "$(id -u)" -eq 0 ]]; then
-    "$@"
-  elif command -v sudo >/dev/null 2>&1; then
-    sudo "$@"
-  else
-    echo "sudo is not available; cannot run: $*" >&2
-    return 1
-  fi
-}
-
-systemctl_cmd() {
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl "$@"
-  else
-    return 127
-  fi
-}
-
-service_exists() {
-  local service="$1"
-  systemctl list-unit-files "$service" --no-legend 2>/dev/null | grep -q . \
-    || systemctl list-units --type=service --all "$service" --no-legend 2>/dev/null | grep -q .
-}
-
-detect_service_from_process() {
-  if [[ ! -d /proc ]]; then
-    return 1
-  fi
-
-  local pid unit
-  while read -r pid _; do
-    [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || continue
-    [[ -r "/proc/$pid/cgroup" ]] || continue
-    unit="$(grep -Eo '[A-Za-z0-9_.@:-]*openclaw[A-Za-z0-9_.@:-]*\.service' "/proc/$pid/cgroup" | head -n 1 || true)"
-    if [[ -n "$unit" ]]; then
-      printf '%s\n' "$unit"
-      return 0
-    fi
-  done < <(pgrep -af 'openclaw|openclaw-gateway' 2>/dev/null || true)
-
-  return 1
-}
-
-detect_openclaw_service() {
-  if [[ -n "$SERVICE_NAME" ]]; then
-    printf '%s\n' "$SERVICE_NAME"
-    return 0
-  fi
-
-  if ! command -v systemctl >/dev/null 2>&1; then
-    return 1
-  fi
-
-  local candidate
-  for candidate in openclaw openclaw-gateway openclaw.service openclaw-gateway.service gateway gateway.service; do
-    if service_exists "${candidate%.service}.service"; then
-      printf '%s\n' "${candidate%.service}.service"
-      return 0
-    fi
-  done
-
-  local discovered
-  discovered="$(
-    {
-      systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}'
-      systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}'
-    } | grep -Ei '(^|[-_.@])(openclaw|openclaw-gateway)([-_.@]|$)' | head -n 1 || true
-  )"
-  if [[ -n "$discovered" ]]; then
-    printf '%s\n' "$discovered"
-    return 0
-  fi
-
-  discovered="$(detect_service_from_process || true)"
-  if [[ -n "$discovered" ]]; then
-    printf '%s\n' "$discovered"
-    return 0
-  fi
-
-  return 1
-}
-
-restart_openclaw() {
-  if [[ "$RESTART_OPENCLAW" -ne 1 ]]; then
-    echo "Skipped OpenClaw restart."
-    return 0
-  fi
-
-  case "$RESTART_METHOD" in
-    auto|systemd|pm2|docker|none) ;;
-    *)
-      echo "Warning: unsupported restart method: $RESTART_METHOD"
-      echo "         Supported: auto, systemd, pm2, docker, none"
-      return 0
-      ;;
-  esac
-
-  if [[ "$RESTART_METHOD" == "none" ]]; then
-    echo "Skipped OpenClaw restart."
-    return 0
-  fi
-
-  if [[ "$RESTART_METHOD" == "auto" || "$RESTART_METHOD" == "systemd" ]]; then
-    restart_openclaw_systemd && return 0
-    [[ "$RESTART_METHOD" == "systemd" ]] && return 0
-  fi
-
-  if [[ "$RESTART_METHOD" == "auto" || "$RESTART_METHOD" == "pm2" ]]; then
-    restart_openclaw_pm2 && return 0
-    [[ "$RESTART_METHOD" == "pm2" ]] && return 0
-  fi
-
-  if [[ "$RESTART_METHOD" == "auto" || "$RESTART_METHOD" == "docker" ]]; then
-    restart_openclaw_docker && return 0
-    [[ "$RESTART_METHOD" == "docker" ]] && return 0
-  fi
-
-  echo "Warning: could not auto-restart OpenClaw."
-  echo "         Tried systemd, pm2, and Docker detection. Config was still written."
-  return 0
-}
-
-restart_openclaw_systemd() {
-  if ! command -v systemctl >/dev/null 2>&1; then
-    return 1
-  fi
-
-  local service
-  if ! service="$(detect_openclaw_service)"; then
-    return 1
-  fi
-
-  echo
-  echo "Restarting OpenClaw service: $service"
-  if run_sudo systemctl restart "$service"; then
-    sleep 2
-    systemctl_cmd is-active --quiet "$service" \
-      && echo "OpenClaw service is active: $service" \
-      || echo "Warning: $service restarted but is not active. Check: systemctl status $service"
-    return 0
-  else
-    echo "Warning: failed to restart $service. Check permissions or service name."
-    return 1
-  fi
-}
-
-restart_openclaw_pm2() {
-  if ! command -v pm2 >/dev/null 2>&1; then
-    return 1
-  fi
-
-  local ids pm2_json
-  pm2_json="$(pm2 jlist 2>/dev/null || true)"
-  ids="$(PM2_JSON="$pm2_json" node <<'NODE' || true
-try {
-  const apps = JSON.parse(process.env.PM2_JSON || "[]");
-  const matches = apps.filter((app) => {
-    const name = String(app.name || "");
-    const script = String(app.pm2_env?.pm_exec_path || "");
-    const args = Array.isArray(app.pm2_env?.args) ? app.pm2_env.args.join(" ") : String(app.pm2_env?.args || "");
-    return /openclaw|gateway/i.test(`${name} ${script} ${args}`);
-  });
-  process.stdout.write(matches.map((app) => String(app.pm_id)).join(" "));
-} catch {}
-NODE
-)"
-
-  [[ -n "$ids" ]] || return 1
-
-  echo
-  echo "Restarting OpenClaw pm2 app(s): $ids"
-  pm2 restart $ids
-  return 0
-}
-
-restart_openclaw_docker() {
-  if ! command -v docker >/dev/null 2>&1; then
-    return 1
-  fi
-
-  local containers
-  containers="$(docker ps --format '{{.ID}} {{.Names}} {{.Image}}' 2>/dev/null | awk 'tolower($0) ~ /openclaw|gateway/ { print $1 }' | tr '\n' ' ' || true)"
-  [[ -n "$containers" ]] || return 1
-
-  echo
-  echo "Restarting OpenClaw docker container(s): $containers"
-  docker restart $containers
-  return 0
-}
 
 TMP_OUTPUT="$(mktemp)"
 cleanup() {
@@ -383,9 +547,10 @@ API_KEY="$API_KEY" \
 WRITE_API_KEY="$WRITE_API_KEY" \
 FREQUENCY="$FREQUENCY" \
 DREAM_MODEL="$DREAM_MODEL" \
+CPU_TUNE="$CPU_TUNE" \
+EMBEDDING_TIMEOUT_SECONDS="$EMBEDDING_TIMEOUT_SECONDS" \
 node >"$TMP_OUTPUT" <<'NODE'
 const fs = require("fs");
-const path = require("path");
 
 const configPath = process.env.CONFIG_PATH;
 const provider = process.env.PROVIDER;
@@ -395,6 +560,8 @@ const apiKey = process.env.API_KEY || "";
 const writeApiKey = process.env.WRITE_API_KEY !== "0";
 const frequency = process.env.FREQUENCY || "0 3 * * *";
 const dreamModel = process.env.DREAM_MODEL || "";
+const cpuTune = process.env.CPU_TUNE === "1";
+const embeddingTimeout = Number(process.env.EMBEDDING_TIMEOUT_SECONDS || 600);
 
 function stripJsonComments(input) {
   let out = "";
@@ -406,13 +573,9 @@ function stripJsonComments(input) {
     const next = input[i + 1];
     if (inString) {
       out += ch;
-      if (escape) {
-        escape = false;
-      } else if (ch === "\\") {
-        escape = true;
-      } else if (ch === quote) {
-        inString = false;
-      }
+      if (escape) escape = false;
+      else if (ch === "\\") escape = true;
+      else if (ch === quote) inString = false;
       continue;
     }
     if (ch === '"' || ch === "'") {
@@ -452,19 +615,16 @@ function parseConfig(text) {
 
 function ensureObject(parent, key, issues) {
   if (!parent[key] || typeof parent[key] !== "object" || Array.isArray(parent[key])) {
-    if (parent[key] !== undefined) {
-      issues.push(`Replaced invalid ${key} value with an object.`);
-    }
+    if (parent[key] !== undefined) issues.push(`Replaced invalid ${key} value with an object.`);
     parent[key] = {};
   }
   return parent[key];
 }
 
 let config = {};
-let existed = fs.existsSync(configPath);
 let issues = [];
 
-if (existed) {
+if (fs.existsSync(configPath)) {
   const raw = fs.readFileSync(configPath, "utf8");
   try {
     config = parseConfig(raw);
@@ -479,28 +639,19 @@ const plugins = ensureObject(config, "plugins", issues);
 const entries = ensureObject(plugins, "entries", issues);
 const memoryCore = ensureObject(entries, "memory-core", issues);
 const memoryCoreConfig = ensureObject(memoryCore, "config", issues);
-
-if (memoryCoreConfig.dreaming && (typeof memoryCoreConfig.dreaming !== "object" || Array.isArray(memoryCoreConfig.dreaming))) {
-  issues.push("plugins.entries.memory-core.config.dreaming was not an object; replaced it.");
-  memoryCoreConfig.dreaming = {};
-}
-
 const dreaming = ensureObject(memoryCoreConfig, "dreaming", issues);
+
 if (dreaming.enabled !== true) {
   if (dreaming.enabled !== undefined) issues.push(`dreaming.enabled was ${JSON.stringify(dreaming.enabled)}; set to true.`);
   dreaming.enabled = true;
 }
-
 if (typeof dreaming.frequency !== "string" || dreaming.frequency.trim() === "") {
   if (dreaming.frequency !== undefined) issues.push("dreaming.frequency was invalid or empty; replaced it.");
   dreaming.frequency = frequency;
 } else if (dreaming.frequency !== frequency && process.env.FREQUENCY) {
   dreaming.frequency = frequency;
 }
-
-if (dreamModel) {
-  dreaming.model = dreamModel;
-}
+if (dreamModel) dreaming.model = dreamModel;
 
 if (dreaming.model) {
   const subagent = ensureObject(memoryCore, "subagent", issues);
@@ -531,9 +682,7 @@ if (provider === "dashscope") {
   dashscope.baseUrl = baseUrl;
   if (apiKey && writeApiKey) dashscope.apiKey = apiKey;
   if (!Array.isArray(dashscope.models)) dashscope.models = [];
-  if (!dashscope.models.some((entry) => entry && entry.id === model)) {
-    dashscope.models.push({ id: model });
-  }
+  if (!dashscope.models.some((entry) => entry && entry.id === model)) dashscope.models.push({ id: model });
   memorySearch.provider = "dashscope-embedding";
   memorySearch.model = model;
 } else if (provider === "openai") {
@@ -550,20 +699,17 @@ if (provider === "dashscope") {
   memorySearch.model = model;
 }
 
-if (!memorySearch.query || typeof memorySearch.query !== "object" || Array.isArray(memorySearch.query)) {
-  memorySearch.query = {};
-}
-if (!memorySearch.query.hybrid || typeof memorySearch.query.hybrid !== "object" || Array.isArray(memorySearch.query.hybrid)) {
-  memorySearch.query.hybrid = {};
-}
+memorySearch.query = memorySearch.query && typeof memorySearch.query === "object" && !Array.isArray(memorySearch.query) ? memorySearch.query : {};
+memorySearch.query.hybrid = memorySearch.query.hybrid && typeof memorySearch.query.hybrid === "object" && !Array.isArray(memorySearch.query.hybrid) ? memorySearch.query.hybrid : {};
 memorySearch.query.hybrid.mmr = Object.assign({}, memorySearch.query.hybrid.mmr, { enabled: true });
 memorySearch.query.hybrid.temporalDecay = Object.assign({}, memorySearch.query.hybrid.temporalDecay, { enabled: true });
 
-const output = {
-  issues,
-  config,
-};
-process.stdout.write(JSON.stringify(output, null, 2));
+if (provider === "ollama" && cpuTune) {
+  memorySearch.sync = memorySearch.sync && typeof memorySearch.sync === "object" && !Array.isArray(memorySearch.sync) ? memorySearch.sync : {};
+  memorySearch.sync.embeddingBatchTimeoutSeconds = embeddingTimeout;
+}
+
+process.stdout.write(JSON.stringify({ issues, config }, null, 2));
 NODE
 
 ISSUES="$(node -e 'const fs=require("fs"); const o=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); console.log(o.issues.length ? o.issues.map(x=>"- "+x).join("\n") : "- none")' "$TMP_OUTPUT")"
@@ -592,24 +738,5 @@ chmod 600 "$CONFIG_PATH" || true
 echo "Updated config written: $CONFIG_PATH"
 
 restart_openclaw
-
-if [[ "$SKIP_INDEX" -eq 0 && -x "$(command -v openclaw 2>/dev/null || true)" ]]; then
-  echo
-  echo "Running OpenClaw memory index/status checks..."
-  openclaw memory index --force --agent main || openclaw memory index --force || true
-  openclaw memory status --deep --agent main || openclaw memory status --deep || true
-else
-  echo
-  echo "Skipped OpenClaw index/status checks."
-fi
-
-cat <<'NEXT'
-
-Next steps:
-  1. The script already tried to restart OpenClaw automatically.
-  2. Run: openclaw memory status --deep --agent main
-  3. If embeddings are still unavailable with Ollama, confirm:
-     - ollama list
-     - curl http://127.0.0.1:11434/api/version
-     - ollama pull nomic-embed-text
-NEXT
+run_openclaw_validation
+print_final_status

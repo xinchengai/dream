@@ -1,107 +1,85 @@
 # OpenClaw Dreaming setup
 
-This helper is aimed at OpenClaw 5.19 deployments. The default path uses local
-Ollama embeddings, so no online embedding API key is required.
+One-command setup for OpenClaw 2026.5.19 Dreaming on CPU-only Alibaba Cloud
+servers. The default path uses local Ollama embeddings, so no online embedding
+API key is required.
 
-## Recommended Ollama run
+## Recommended run
 
 ```bash
-cd /path/to/xincheng
-./tools/openclaw_enable_dreaming.sh
+git clone https://github.com/xinchengai/dream.git
+cd dream
+chmod +x tools/openclaw_enable_dreaming.sh
+./tools/openclaw_enable_dreaming.sh --install-ollama
 ```
 
-The script writes `~/.openclaw/openclaw.json`, backs up any existing config, and
-uses:
+The script is idempotent and can be run again. It backs up existing config before
+writing changes.
 
-- Dreaming: `plugins.entries.memory-core.config.dreaming.enabled = true`
-- Schedule: `0 3 * * *`
-- Embeddings provider: `ollama`
-- Embeddings model: `nomic-embed-text`
+## What it does
 
-It also tries to restart OpenClaw automatically after writing the config. The
-script checks systemd services, running OpenClaw processes, pm2 apps, and Docker
-containers. You usually do not need to know the service name.
+- Installs and starts Ollama when `--install-ollama` is used.
+- Tunes Ollama for CPU-only servers:
+  - `OLLAMA_HOST=127.0.0.1:11434`
+  - `OLLAMA_NUM_PARALLEL=1`
+  - `OLLAMA_MAX_LOADED_MODELS=1`
+  - `OLLAMA_KEEP_ALIVE=10m`
+  - `OLLAMA_LOAD_TIMEOUT=10m`
+  - `OLLAMA_MAX_QUEUE=64`
+- Pulls `nomic-embed-text` only when missing.
+- Warms up the embedding endpoint.
+- Enables OpenClaw Dreaming:
+  - `plugins.entries.memory-core.config.dreaming.enabled = true`
+  - `plugins.entries.memory-core.config.dreaming.frequency = "0 3 * * *"`
+- Configures memory search:
+  - `provider = "ollama"`
+  - `model = "nomic-embed-text"`
+  - `sync.embeddingBatchTimeoutSeconds = 600`
+- Restarts OpenClaw when it can detect systemd, pm2, or Docker.
+- Runs `openclaw memory index --force --agent main`.
+- Runs `openclaw memory status --deep --agent main` and prints `SUCCESS` only
+  when Provider, Embeddings, Semantic vectors, and Dreaming are ready.
 
-Advanced override if you already know the exact service name:
+## Useful options
+
+Skip CPU tuning:
+
+```bash
+./tools/openclaw_enable_dreaming.sh --no-cpu-tune
+```
+
+Use a custom embedding timeout:
+
+```bash
+./tools/openclaw_enable_dreaming.sh --embedding-timeout 900
+```
+
+Force a known OpenClaw systemd service:
 
 ```bash
 ./tools/openclaw_enable_dreaming.sh --service-name your-openclaw.service
 ```
 
-If Ollama is not installed on your Linux server, run:
+Dry run without writing config:
 
 ```bash
-./tools/openclaw_enable_dreaming.sh --install-ollama
+./tools/openclaw_enable_dreaming.sh --dry-run --skip-index --no-pull-ollama
 ```
 
-If Ollama is already installed but the service is not running:
+## Expected success
 
-```bash
-sudo systemctl enable --now ollama
+The final status should include:
+
+```text
+SUCCESS: OpenClaw Dreaming is configured with Ollama CPU-only embeddings.
 ```
 
-## Dry run first
+`openclaw memory status --deep --agent main` should show:
 
-```bash
-./tools/openclaw_enable_dreaming.sh --dry-run
-```
-
-## Useful alternatives
-
-Alibaba Cloud Model Studio / DashScope embeddings:
-
-```bash
-DASHSCOPE_API_KEY="sk-your-key" ./tools/openclaw_enable_dreaming.sh --provider dashscope
-```
-
-OpenAI embeddings:
-
-```bash
-OPENAI_API_KEY="sk-your-key" ./tools/openclaw_enable_dreaming.sh --provider openai
-```
-
-Custom schedule:
-
-```bash
-./tools/openclaw_enable_dreaming.sh --frequency "0 */6 * * *"
-```
-
-## What it checks
-
-- Creates `~/.openclaw/workspace/memory/.dreams`.
-- Creates `~/.openclaw/openclaw.json` if missing.
-- Parses existing JSON or simple JSON5-style config.
-- Backs up existing config to `openclaw.json.bak.YYYYMMDDHHMMSS`.
-- Ensures `plugins.entries.memory-core.config.dreaming.enabled` is `true`.
-- Ensures a valid `dreaming.frequency`.
-- If `dreaming.model` is present, fixes the required subagent trust gate:
-  `allowModelOverride: true` and `allowedModels`.
-- Enables `agents.defaults.memorySearch`.
-- Configures embeddings for DashScope/OpenAI/Ollama.
-- Pulls the Ollama embedding model by default when using `--provider ollama`.
-- Enables MMR and temporal decay for higher quality retrieval.
-- Restarts the OpenClaw systemd service when it can identify it.
-
-## Verify
-
-The script attempts to restart OpenClaw before indexing. Then verify:
-
-```bash
-openclaw memory index --force --agent main
-openclaw memory status --deep --agent main
-```
-
-Expected healthy signs:
-
-- `Dreaming:` shows a cron schedule such as `0 3 * * *`
-- `Embeddings:` is available
-- `Semantic vectors:` is available after indexing
-- `Issues:` no longer reports the memory directory missing
-
-If embeddings are still unavailable with Ollama, make sure the Ollama service is
-running and the model exists:
-
-```bash
-ollama list
-curl http://127.0.0.1:11434/api/version
+```text
+Provider: ollama
+Model: nomic-embed-text
+Embeddings: ready
+Semantic vectors: ready
+Dreaming: 0 3 * * *
 ```
