@@ -201,7 +201,7 @@ install_or_start_ollama() {
 
 ollama_model_present() {
   command -v ollama >/dev/null 2>&1 || return 1
-  ollama list 2>/dev/null | awk 'NR > 1 { print $1 }' | grep -Fxq "$MODEL"
+  ollama list </dev/null 2>/dev/null | awk 'NR > 1 { print $1 }' | grep -Fxq "$MODEL"
 }
 
 pull_ollama_model() {
@@ -217,7 +217,7 @@ pull_ollama_model() {
   if ollama_model_present; then
     echo "Ollama model already present: $MODEL"
   else
-    ollama pull "$MODEL"
+    ollama pull "$MODEL" </dev/null
   fi
 }
 
@@ -342,7 +342,7 @@ NODE
 
   echo
   echo "Restarting OpenClaw pm2 app(s): $ids"
-  pm2 restart $ids
+  pm2 restart $ids </dev/null
   OPENCLAW_RESTART_CONFIRMED=1
   return 0
 }
@@ -356,7 +356,7 @@ restart_openclaw_docker() {
 
   echo
   echo "Restarting OpenClaw docker container(s): $containers"
-  docker restart $containers
+  docker restart $containers </dev/null
   OPENCLAW_RESTART_CONFIRMED=1
   return 0
 }
@@ -409,11 +409,11 @@ run_openclaw_validation() {
 
   echo
   echo "Running OpenClaw memory index/status checks..."
-  openclaw memory index --force --agent main || openclaw memory index --force || true
+  openclaw memory index --force --agent main </dev/null || openclaw memory index --force </dev/null || true
 
   local status_output status_file
   status_file="$(mktemp)"
-  openclaw memory status --deep --agent main >"$status_file" 2>&1 || openclaw memory status --deep >"$status_file" 2>&1 || true
+  openclaw memory status --deep --agent main >"$status_file" 2>&1 </dev/null || openclaw memory status --deep >"$status_file" 2>&1 </dev/null || true
   status_output="$(cat "$status_file")"
   rm -f "$status_file"
   printf '%s\n' "$status_output"
@@ -519,7 +519,7 @@ echo "CPU tuning: $([[ "$CPU_TUNE" -eq 1 ]] && echo enabled || echo disabled)"
 
 if command -v openclaw >/dev/null 2>&1; then
   echo "Detected OpenClaw:"
-  openclaw --version || true
+  openclaw --version </dev/null || true
 else
   echo "openclaw command not found on PATH. The script will still update config."
 fi
