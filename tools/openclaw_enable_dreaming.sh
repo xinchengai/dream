@@ -16,6 +16,7 @@ PULL_OLLAMA=1
 INSTALL_OLLAMA=0
 RESTART_OPENCLAW=1
 SERVICE_NAME="${OPENCLAW_SERVICE_NAME:-}"
+RESTART_METHOD="auto"
 
 usage() {
   cat <<'USAGE'
@@ -28,7 +29,7 @@ What it does:
   - Enables plugins.entries.memory-core.config.dreaming.
   - Checks and fixes common dreaming.model trust-gate config issues.
   - Configures agents.defaults.memorySearch embedding provider.
-  - Restarts OpenClaw when it can identify a systemd service.
+  - Detects and restarts the OpenClaw service when possible.
   - Optionally runs openclaw memory index/status when openclaw is on PATH.
 
 Recommended local Ollama run:
@@ -59,6 +60,7 @@ Options:
   --pull-ollama         For --provider ollama, run: ollama pull MODEL. Default for ollama.
   --no-pull-ollama      For --provider ollama, skip model pull.
   --service-name NAME   OpenClaw systemd service name. Auto-detected by default.
+  --restart-method M    Restart method: auto, systemd, pm2, docker, none.
   --no-restart          Do not restart OpenClaw service after writing config.
   --skip-index          Do not run openclaw memory index/status.
   --dry-run             Print the updated config without writing it.
@@ -81,7 +83,8 @@ while [[ $# -gt 0 ]]; do
     --pull-ollama) PULL_OLLAMA=1; shift ;;
     --no-pull-ollama) PULL_OLLAMA=0; shift ;;
     --service-name) SERVICE_NAME="${2:?missing service name}"; shift 2 ;;
-    --no-restart) RESTART_OPENCLAW=0; shift ;;
+    --restart-method) RESTART_METHOD="${2:?missing restart method}"; shift 2 ;;
+    --no-restart) RESTART_OPENCLAW=0; RESTART_METHOD="none"; shift ;;
     --skip-index) SKIP_INDEX=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -151,6 +154,13 @@ if [[ "$PROVIDER" == "ollama" ]]; then
       fi
       echo "Installing Ollama with the official installer..."
       curl -fsSL https://ollama.com/install.sh | sh
+      if command -v systemctl >/dev/null 2>&1; then
+        if [[ "$(id -u)" -eq 0 ]]; then
+          systemctl enable --now ollama || true
+        elif command -v sudo >/dev/null 2>&1; then
+          sudo systemctl enable --now ollama || true
+        fi
+      fi
     else
       echo "Warning: ollama is not installed or not on PATH."
       echo "         Install it first, or rerun this script with --install-ollama on Linux."
@@ -187,6 +197,31 @@ systemctl_cmd() {
   fi
 }
 
+service_exists() {
+  local service="$1"
+  systemctl list-unit-files "$service" --no-legend 2>/dev/null | grep -q . \
+    || systemctl list-units --type=service --all "$service" --no-legend 2>/dev/null | grep -q .
+}
+
+detect_service_from_process() {
+  if [[ ! -d /proc ]]; then
+    return 1
+  fi
+
+  local pid unit
+  while read -r pid _; do
+    [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ -r "/proc/$pid/cgroup" ]] || continue
+    unit="$(grep -Eo '[A-Za-z0-9_.@:-]*openclaw[A-Za-z0-9_.@:-]*\.service' "/proc/$pid/cgroup" | head -n 1 || true)"
+    if [[ -n "$unit" ]]; then
+      printf '%s\n' "$unit"
+      return 0
+    fi
+  done < <(pgrep -af 'openclaw|openclaw-gateway' 2>/dev/null || true)
+
+  return 1
+}
+
 detect_openclaw_service() {
   if [[ -n "$SERVICE_NAME" ]]; then
     printf '%s\n' "$SERVICE_NAME"
@@ -198,15 +233,26 @@ detect_openclaw_service() {
   fi
 
   local candidate
-  for candidate in openclaw openclaw-gateway openclaw.service openclaw-gateway.service; do
-    if systemctl list-unit-files "${candidate%.service}.service" --no-legend 2>/dev/null | grep -q .; then
+  for candidate in openclaw openclaw-gateway openclaw.service openclaw-gateway.service gateway gateway.service; do
+    if service_exists "${candidate%.service}.service"; then
       printf '%s\n' "${candidate%.service}.service"
       return 0
     fi
   done
 
   local discovered
-  discovered="$(systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^openclaw.*\.service$' | head -n 1 || true)"
+  discovered="$(
+    {
+      systemctl list-units --type=service --all --no-legend 2>/dev/null | awk '{print $1}'
+      systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}'
+    } | grep -Ei '(^|[-_.@])(openclaw|openclaw-gateway)([-_.@]|$)' | head -n 1 || true
+  )"
+  if [[ -n "$discovered" ]]; then
+    printf '%s\n' "$discovered"
+    return 0
+  fi
+
+  discovered="$(detect_service_from_process || true)"
   if [[ -n "$discovered" ]]; then
     printf '%s\n' "$discovered"
     return 0
@@ -221,17 +267,48 @@ restart_openclaw() {
     return 0
   fi
 
-  if ! command -v systemctl >/dev/null 2>&1; then
-    echo "Warning: systemctl not found; cannot auto-restart OpenClaw."
-    echo "         Restart your OpenClaw Gateway/service manually."
+  case "$RESTART_METHOD" in
+    auto|systemd|pm2|docker|none) ;;
+    *)
+      echo "Warning: unsupported restart method: $RESTART_METHOD"
+      echo "         Supported: auto, systemd, pm2, docker, none"
+      return 0
+      ;;
+  esac
+
+  if [[ "$RESTART_METHOD" == "none" ]]; then
+    echo "Skipped OpenClaw restart."
     return 0
+  fi
+
+  if [[ "$RESTART_METHOD" == "auto" || "$RESTART_METHOD" == "systemd" ]]; then
+    restart_openclaw_systemd && return 0
+    [[ "$RESTART_METHOD" == "systemd" ]] && return 0
+  fi
+
+  if [[ "$RESTART_METHOD" == "auto" || "$RESTART_METHOD" == "pm2" ]]; then
+    restart_openclaw_pm2 && return 0
+    [[ "$RESTART_METHOD" == "pm2" ]] && return 0
+  fi
+
+  if [[ "$RESTART_METHOD" == "auto" || "$RESTART_METHOD" == "docker" ]]; then
+    restart_openclaw_docker && return 0
+    [[ "$RESTART_METHOD" == "docker" ]] && return 0
+  fi
+
+  echo "Warning: could not auto-restart OpenClaw."
+  echo "         Tried systemd, pm2, and Docker detection. Config was still written."
+  return 0
+}
+
+restart_openclaw_systemd() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 1
   fi
 
   local service
   if ! service="$(detect_openclaw_service)"; then
-    echo "Warning: could not auto-detect the OpenClaw systemd service."
-    echo "         Rerun with --service-name NAME, or restart OpenClaw manually."
-    return 0
+    return 1
   fi
 
   echo
@@ -241,9 +318,55 @@ restart_openclaw() {
     systemctl_cmd is-active --quiet "$service" \
       && echo "OpenClaw service is active: $service" \
       || echo "Warning: $service restarted but is not active. Check: systemctl status $service"
+    return 0
   else
     echo "Warning: failed to restart $service. Check permissions or service name."
+    return 1
   fi
+}
+
+restart_openclaw_pm2() {
+  if ! command -v pm2 >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local ids pm2_json
+  pm2_json="$(pm2 jlist 2>/dev/null || true)"
+  ids="$(PM2_JSON="$pm2_json" node <<'NODE' || true
+try {
+  const apps = JSON.parse(process.env.PM2_JSON || "[]");
+  const matches = apps.filter((app) => {
+    const name = String(app.name || "");
+    const script = String(app.pm2_env?.pm_exec_path || "");
+    const args = Array.isArray(app.pm2_env?.args) ? app.pm2_env.args.join(" ") : String(app.pm2_env?.args || "");
+    return /openclaw|gateway/i.test(`${name} ${script} ${args}`);
+  });
+  process.stdout.write(matches.map((app) => String(app.pm_id)).join(" "));
+} catch {}
+NODE
+)"
+
+  [[ -n "$ids" ]] || return 1
+
+  echo
+  echo "Restarting OpenClaw pm2 app(s): $ids"
+  pm2 restart $ids
+  return 0
+}
+
+restart_openclaw_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local containers
+  containers="$(docker ps --format '{{.ID}} {{.Names}} {{.Image}}' 2>/dev/null | awk 'tolower($0) ~ /openclaw|gateway/ { print $1 }' | tr '\n' ' ' || true)"
+  [[ -n "$containers" ]] || return 1
+
+  echo
+  echo "Restarting OpenClaw docker container(s): $containers"
+  docker restart $containers
+  return 0
 }
 
 TMP_OUTPUT="$(mktemp)"
@@ -483,7 +606,7 @@ fi
 cat <<'NEXT'
 
 Next steps:
-  1. If auto-restart did not find your service, rerun with: --service-name NAME
+  1. The script already tried to restart OpenClaw automatically.
   2. Run: openclaw memory status --deep --agent main
   3. If embeddings are still unavailable with Ollama, confirm:
      - ollama list

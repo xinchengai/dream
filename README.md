@@ -18,9 +18,11 @@ uses:
 - Embeddings provider: `ollama`
 - Embeddings model: `nomic-embed-text`
 
-It also tries to restart the OpenClaw systemd service automatically after
-writing the config. If your service is not named `openclaw` or
-`openclaw-gateway`, pass it explicitly:
+It also tries to restart OpenClaw automatically after writing the config. The
+script checks systemd services, running OpenClaw processes, pm2 apps, and Docker
+containers. You usually do not need to know the service name.
+
+Advanced override if you already know the exact service name:
 
 ```bash
 ./tools/openclaw_enable_dreaming.sh --service-name your-openclaw.service
@@ -82,9 +84,7 @@ Custom schedule:
 
 ## Verify
 
-The script attempts to restart OpenClaw before indexing. If auto-detection did
-not find your service, rerun with `--service-name NAME` or restart OpenClaw
-manually. Then verify:
+The script attempts to restart OpenClaw before indexing. Then verify:
 
 ```bash
 openclaw memory index --force --agent main
