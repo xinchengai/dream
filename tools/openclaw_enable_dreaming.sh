@@ -14,7 +14,7 @@ FREQUENCY="${OPENCLAW_DREAMING_FREQUENCY:-0 3 * * *}"
 DREAM_MODEL="${OPENCLAW_DREAMING_MODEL:-}"
 
 DRY_RUN=0
-SKIP_INDEX=0
+SKIP_INDEX=1
 PULL_OLLAMA=1
 INSTALL_OLLAMA=0
 RESTART_OPENCLAW=1
@@ -38,7 +38,7 @@ What it does:
   - Enables OpenClaw Dreaming.
   - Configures local Ollama embeddings.
   - Restarts OpenClaw when possible.
-  - Indexes and validates memory search readiness.
+  - Prints the final status command for manual verification.
 
 Recommended Alibaba Cloud CPU-only run:
   tools/openclaw_enable_dreaming.sh --install-ollama
@@ -71,7 +71,8 @@ Options:
   --service-name NAME   OpenClaw systemd service name. Auto-detected by default.
   --restart-method M    Restart method: auto, systemd, pm2, docker, none.
   --no-restart          Do not restart OpenClaw after writing config.
-  --skip-index          Do not run OpenClaw memory index/status validation.
+  --run-check           Run OpenClaw memory index/status validation inside script.
+  --skip-index          Deprecated alias; validation is skipped by default.
   --dry-run             Print the updated config without writing it.
   -h, --help            Show this help.
 USAGE
@@ -441,7 +442,9 @@ print_final_status() {
       echo "OpenClaw restart: not confirmed, but memory validation succeeded."
     fi
   elif [[ "$VALIDATION_STATUS" == "skipped" ]]; then
-    echo "DONE: Config was written. Validation was skipped."
+    echo "DONE: Config was written."
+    echo "Run this check next:"
+    echo "  openclaw memory status --deep --agent main"
   else
     echo "DONE WITH WARNINGS: Config was written, but final validation did not report full readiness."
     echo "Expected: Provider: ollama, Embeddings: ready, Semantic vectors: ready, Dreaming: ..."
@@ -468,6 +471,7 @@ while [[ $# -gt 0 ]]; do
     --service-name) SERVICE_NAME="${2:?missing service name}"; shift 2 ;;
     --restart-method) RESTART_METHOD="${2:?missing restart method}"; shift 2 ;;
     --no-restart) RESTART_OPENCLAW=0; RESTART_METHOD="none"; shift ;;
+    --run-check) SKIP_INDEX=0; shift ;;
     --skip-index) SKIP_INDEX=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;

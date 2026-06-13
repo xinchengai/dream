@@ -7,10 +7,7 @@ API key is required.
 ## Recommended run
 
 ```bash
-git clone https://github.com/xinchengai/dream.git
-cd dream
-chmod +x tools/openclaw_enable_dreaming.sh
-./tools/openclaw_enable_dreaming.sh --install-ollama
+curl -fsSL https://raw.githubusercontent.com/xinchengai/dream/main/tools/openclaw_enable_dreaming.sh | bash -s -- --install-ollama
 ```
 
 The script is idempotent and can be run again. It backs up existing config before
@@ -36,9 +33,8 @@ writing changes.
   - `model = "nomic-embed-text"`
   - `sync.embeddingBatchTimeoutSeconds = 600`
 - Restarts OpenClaw when it can detect systemd, pm2, or Docker.
-- Runs `openclaw memory index --force --agent main`.
-- Runs `openclaw memory status --deep --agent main` and prints `SUCCESS` only
-  when Provider, Embeddings, Semantic vectors, and Dreaming are ready.
+- Prints the final manual check command:
+  `openclaw memory status --deep --agent main`.
 
 ## Useful options
 
@@ -66,15 +62,29 @@ Dry run without writing config:
 ./tools/openclaw_enable_dreaming.sh --dry-run --skip-index --no-pull-ollama
 ```
 
-## Expected success
+Run the OpenClaw check inside the script:
 
-The final status should include:
-
-```text
-SUCCESS: OpenClaw Dreaming is configured with Ollama CPU-only embeddings.
+```bash
+./tools/openclaw_enable_dreaming.sh --run-check
 ```
 
-`openclaw memory status --deep --agent main` should show:
+## Expected success
+
+The script should end with:
+
+```text
+DONE: Config was written.
+Run this check next:
+  openclaw memory status --deep --agent main
+```
+
+Then run:
+
+```bash
+openclaw memory status --deep --agent main
+```
+
+Expected status:
 
 ```text
 Provider: ollama
