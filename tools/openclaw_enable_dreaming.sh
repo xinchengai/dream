@@ -411,14 +411,18 @@ run_openclaw_validation() {
   echo "Running OpenClaw memory index/status checks..."
   openclaw memory index --force --agent main || openclaw memory index --force || true
 
-  local status_output
-  status_output="$(openclaw memory status --deep --agent main 2>&1 || openclaw memory status --deep 2>&1 || true)"
+  local status_output status_file
+  status_file="$(mktemp)"
+  openclaw memory status --deep --agent main >"$status_file" 2>&1 || openclaw memory status --deep >"$status_file" 2>&1 || true
+  status_output="$(cat "$status_file")"
+  rm -f "$status_file"
   printf '%s\n' "$status_output"
 
-  if grep -q 'Provider: ollama' <<<"$status_output" \
-    && grep -q 'Embeddings: ready' <<<"$status_output" \
-    && grep -q 'Semantic vectors: ready' <<<"$status_output" \
-    && grep -q 'Dreaming:' <<<"$status_output"; then
+  if grep -Eq 'Provider:[[:space:]]+ollama' <<<"$status_output" \
+    && grep -Eq 'Model:[[:space:]]+nomic-embed-text' <<<"$status_output" \
+    && grep -Eq 'Embeddings:[[:space:]]+(ready|available)' <<<"$status_output" \
+    && grep -Eq 'Semantic vectors:[[:space:]]+ready' <<<"$status_output" \
+    && grep -Eq 'Dreaming:[[:space:]]+' <<<"$status_output"; then
     VALIDATION_STATUS="success"
     return 0
   fi
